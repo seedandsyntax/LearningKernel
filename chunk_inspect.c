@@ -1,4 +1,4 @@
-/* chunk_inspect_v6.c */
+/* chunk_inspect_v19.c */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,17 +7,32 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <stdarg.h>
+
+/* Linker symbols for exact section boundaries */
+extern char __data_start;
+extern char _edata;
+extern char __bss_start;
+extern char _end;
 
 /* ---------- CONFIG ---------- */
-static unsigned char FILL_BYTE         = 0xAA;
+static unsigned char FILL_BYTE         = 0xAA;       // Lives in .data
 static size_t        DISPLAY_MAX_BYTES = 64;
 static int           FREE_AT_END       = 1;
-static int           DUMP_AFTER_FREE   = 0;
 
-/* The exact sequence from your screenshot */
 static size_t REQUESTED_BYTES[] = {
     100, 1000, 127999, 140000, 120000, 110000, 200, 999888444
 };
+
+/* ---------- RUNTIME GLOBALS ---------- */
+#define MAX_N 64
+static int    N;
+static void  *P[MAX_N];
+static size_t REQ[MAX_N];
+static int    IS_MMAPPED_ARR[MAX_N];
+
+static uint64_t HEAP_BASE = 0;
+static uint64_t HEAP_TOP  = 0; // Highest allocated chunk end
 
 /* ---------- COLOR ---------- */
 #define C_RESET   "\033[0m"
@@ -56,30 +71,19 @@ static void field_addr(const char *label, uint64_t a) {
     c_(C_DIM); printf("0x%" PRIx64 "\n", a); cr_();
 }
 
-static void field_value(const char *label, uint64_t v) {
-    field_label(label);
-    printf("0x%016" PRIx64 "\n", v);
-}
-
-static void print_byte(uint8_t b) {
-    if (!COLOR) { printf("%02x", b); return; }
-    if (b == FILL_BYTE && b != 0) fputs(C_BMAG, stdout);
-    else if (b == 0)              fputs(C_GRAY, stdout);
-    else                          fputs(C_CYAN, stdout);
-    printf("%02x", b);
-    cr_();
-}
-
-static void print_memory_row(uint64_t v) {
-    for (int i = 0; i < 8; i++) {
-        print_byte((v >> (8*i)) & 0xff);
-        if (i < 7) printf(" ");
-    }
-}
-
 static void field_memory(const char *label, uint64_t v) {
     field_label(label);
-    print_memory_row(v);
+    if (!COLOR) printf("%016" PRIx64, v);
+    else {
+        for (int i = 0; i < 8; i++) {
+            uint8_t b = (v >> (8*i)) & 0xff;
+            if (b == FILL_BYTE && b != 0) fputs(C_BMAG, stdout);
+            else if (b == 0)              fputs(C_GRAY, stdout);
+            else                          fputs(C_CYAN, stdout);
+            printf("%02x ", b);
+            cr_();
+        }
+    }
     c_(C_DIM); printf("  (memory order)\n"); cr_();
 }
 
@@ -95,17 +99,269 @@ static void print_bit(int number, const char *name, int value,
     printf("  %s\n", value ? meaning_1 : meaning_0);
 }
 
-/* ---------- RUNTIME ---------- */
-#define MAX_N 64
-static int    N;
-static void  *P[MAX_N];
-static size_t REQ[MAX_N];
-static int    IS_MMAPPED_ARR[MAX_N];
+static void format_size(uint64_t bytes, char *out, size_t max) {
+    if (bytes < 1024) {
+        snprintf(out, max, "%lu bytes", bytes);
+    } else {
+        snprintf(out, max, "%lu bytes (%.3f KiB)", bytes, bytes / 1024.0);
+    }
+}
 
-/* Heap region tracking */
-static uint64_t HEAP_BASE = 0;
-static uint64_t HEAP_TOP  = 0;
-static const uint64_t MMAP_THRESHOLD = 128 * 1024;
+/* ---------- VIRTUAL MEMORY MAP GENERATOR ---------- */
+
+#define BOX_WIDTH 64
+
+static int visible_len(const char *s) {
+    int len = 0;
+    int in_ansi = 0;
+    for (int i = 0; s[i] != '\0'; i++) {
+        if (s[i] == '\033') in_ansi = 1;
+        else if (in_ansi && s[i] == 'm') in_ansi = 0;
+        else if (!in_ansi) len++;
+    }
+    return len;
+}
+
+static void box_top(const char *addr_str) {
+    printf("  %-18s ┌", addr_str);
+    for (int i = 0; i < BOX_WIDTH + 2; i++) printf("─");
+    printf("┐\n");
+}
+
+static void box_mid(const char *addr_str) {
+    printf("  %-18s ├", addr_str);
+    for (int i = 0; i < BOX_WIDTH + 2; i++) printf("─");
+    printf("┤\n");
+}
+
+static void box_bot(const char *addr_str) {
+    printf("  %-18s └", addr_str);
+    for (int i = 0; i < BOX_WIDTH + 2; i++) printf("─");
+    printf("┘\n");
+}
+
+static void box_line(const char *fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    int len = visible_len(buf);
+    printf("  %-18s │ ", "");
+    fputs(buf, stdout);
+    for (int i = len; i < BOX_WIDTH; i++) putchar(' ');
+    printf(" │\n");
+}
+
+static uint64_t get_process_rss_kb(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    uint64_t rss = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            sscanf(line + 6, "%lu", &rss);
+            break;
+        }
+    }
+    fclose(f);
+    return rss;
+}
+
+static void get_mmap_info(uint64_t *sum_bytes, uint64_t *count, uint64_t *min_addr, uint64_t *max_addr, uint64_t *rss_kb) {
+    FILE *f = fopen("/proc/self/smaps", "r");
+    if (!f) return;
+    char line[256];
+    uint64_t s, e;
+    uint64_t heap_end = 0, stack_start = 0xFFFFFFFFFFFFFFFF;
+    
+    // First pass: find heap and stack
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "[stack]")) sscanf(line, "%lx-", &stack_start);
+        if (strstr(line, "[heap]")) sscanf(line, "%lx-%lx", &s, &e), heap_end = e;
+    }
+    rewind(f);
+
+    *sum_bytes = 0;
+    *count = 0;
+    *min_addr = 0xFFFFFFFFFFFFFFFF;
+    *max_addr = 0;
+    *rss_kb = 0;
+    int in_target_region = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%lx-%lx", &s, &e) == 2) {
+            if (s >= heap_end && e <= stack_start && !strstr(line, "[vvar]") && !strstr(line, "[vdso]") && !strstr(line, "[vsyscall]")) {
+                in_target_region = 1;
+                *sum_bytes += (e - s);
+                (*count)++;
+                if (s < *min_addr) *min_addr = s;
+                if (e > *max_addr) *max_addr = e;
+            } else {
+                in_target_region = 0;
+            }
+        } else if (in_target_region && strncmp(line, "Rss:", 4) == 0) {
+            uint64_t rss;
+            sscanf(line + 4, "%lu", &rss);
+            *rss_kb += rss;
+        }
+    }
+    fclose(f);
+}
+
+static void draw_vmem_map(void) {
+    uint64_t s_start, s_end, h_start, h_end;
+    uint64_t text_start = 0, text_end = 0;
+    uint64_t rodata_start = 0, rodata_end = 0;
+
+    char exe_path[512];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path)-1);
+    if (len != -1) {
+        exe_path[len] = '\0';
+        FILE *f = fopen("/proc/self/maps", "r");
+        if (f) {
+            char line[512];
+            while (fgets(line, sizeof(line), f)) {
+                uint64_t s, e;
+                if (sscanf(line, "%lx-%lx", &s, &e) == 2 && strstr(line, exe_path)) {
+                    if (strstr(line, "r-xp")) { text_start = s; text_end = e; }
+                    if (strstr(line, "r--p")) { rodata_start = s; rodata_end = e; }
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    uint64_t mmap_sum_bytes, mmap_count, mmap_min, mmap_max, mmap_rss_kb;
+    get_mmap_info(&mmap_sum_bytes, &mmap_count, &mmap_min, &mmap_max, &mmap_rss_kb);
+    uint64_t process_rss_kb = get_process_rss_kb();
+
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            uint64_t s, e;
+            if (sscanf(line, "%lx-%lx", &s, &e) == 2) {
+                if (strstr(line, "[stack]")) { s_start = s; s_end = e; }
+                if (strstr(line, "[heap]"))  { h_start = s; h_end = e; }
+            }
+        }
+        fclose(f);
+    }
+
+    char sz_stack[64], sz_mmap[64], sz_heap[64], sz_top[64];
+    char sz_data[64], sz_bss[64], sz_rodata[64], sz_text[64];
+
+    format_size(s_end - s_start, sz_stack, sizeof(sz_stack));
+    format_size(mmap_sum_bytes, sz_mmap, sizeof(sz_mmap));
+    format_size(h_end - h_start, sz_heap, sizeof(sz_heap));
+    format_size(h_end - HEAP_TOP, sz_top, sizeof(sz_top));
+    
+    uint64_t data_start = (uint64_t)&__data_start;
+    uint64_t data_end   = (uint64_t)&_edata;
+    uint64_t bss_start  = (uint64_t)&__bss_start;
+    uint64_t bss_end    = (uint64_t)&_end;
+
+    format_size(data_end - data_start, sz_data, sizeof(sz_data));
+    format_size(bss_end - bss_start, sz_bss, sizeof(sz_bss));
+    format_size(rodata_end - rodata_start, sz_rodata, sizeof(sz_rodata));
+    format_size(text_end - text_start, sz_text, sizeof(sz_text));
+
+    printf("\n");
+    rule_heavy();
+    c_(C_BCYAN); printf("  LINUX x86-64 VIRTUAL ADDRESS MAP (4-LEVEL PAGING)\n"); cr_();
+    c_(C_DIM); printf("  Total Process RSS: %" PRIu64 " KB (physical RAM backing mapped pages)\n", process_rss_kb); cr_();
+    rule_heavy();
+    printf("\n");
+
+    box_top("0xffffffffffffffff");
+    box_line(C_BRED "                       KERNEL SPACE" C_RESET);
+    box_line(C_DIM "            (direct mapping, vmalloc, kernel code)" C_RESET);
+    box_line(C_DIM "            [8 TiB guard hole below, omitted for scale]" C_RESET);
+    box_mid("0xffff800000000000");
+    
+    box_line("");
+    box_line(C_DIM "                   NON-CANONICAL GAP" C_RESET);
+    box_line(C_DIM "          (unaddressable by 48-bit pointers)" C_RESET);
+    box_line("");
+    
+    box_mid("0x0000800000000000");
+    box_mid("0x00007fffffffffff"); 
+    box_line(C_DIM "           [4 KiB guard hole at top of user space]" C_RESET);
+    box_mid("0x00007ffffffff000"); 
+    
+    // STACK
+    box_line(C_CYAN "[STACK]    local variables, function frames" C_RESET);
+    box_line("           range: 0x%016" PRIx64 " - 0x%016" PRIx64, s_start, s_end);
+    box_line("           size:  %s", sz_stack);
+    box_mid(" ");
+    
+    box_line(C_DIM "                   UNMAPPED GAP" C_RESET);
+    box_mid(" ");
+
+    // MMAP REGION
+    box_line(C_BYELLOW "[MMAP]     shared libs & large mallocs" C_RESET);
+    box_line("           span:  0x%016" PRIx64 " - 0x%016" PRIx64, mmap_min, mmap_max);
+    box_line("           mapped: %s across %" PRIu64 " regions", sz_mmap, mmap_count);
+    box_line("           RSS:   %" PRIu64 " KB resident in physical RAM", mmap_rss_kb);
+    for (int i = 0; i < N; i++) {
+        if (IS_MMAPPED_ARR[i]) {
+            box_line("           malloc(%6zu) -> 0x%016" PRIx64, REQ[i], (uint64_t)P[i]);
+        }
+    }
+    box_mid(" ");
+    
+    box_line(C_DIM "                   UNMAPPED GAP" C_RESET);
+    box_mid(" ");
+
+    // HEAP REGION
+    box_line(C_BGREEN "[HEAP]     brk region (contiguous, grows upward)" C_RESET);
+    box_line("           range: 0x%016" PRIx64 " - 0x%016" PRIx64, h_start, h_end);
+    box_line("           size:  %s", sz_heap);
+    for (int i = 0; i < N; i++) {
+        if (!IS_MMAPPED_ARR[i]) {
+            uint64_t chunk_start = (uint64_t)P[i] - 16;
+            uint64_t raw_size = *(uint64_t*)((char*)P[i] - 8);
+            uint64_t nb = raw_size & ~0xfULL;
+            uint64_t chunk_end = chunk_start + nb;
+            box_line("           chunk [0x%016" PRIx64 " - 0x%016" PRIx64 ")", chunk_start, chunk_end);
+        } else {
+            box_line(C_DIM "           (mmap bypassed heap — top unchanged)" C_RESET);
+        }
+    }
+    
+    box_line(C_BGREEN "           [TOP CHUNK] free space remaining in heap" C_RESET);
+    box_line("           range: 0x%016" PRIx64 " - 0x%016" PRIx64, HEAP_TOP, h_end);
+    box_line("           size:  %s", sz_top);
+    box_mid(" ");
+    
+    // DATA
+    box_line(C_BBLUE "[DATA]     initialized writable globals" C_RESET);
+    box_line("           range: 0x%016" PRIx64 " - 0x%016" PRIx64, data_start, data_end);
+    box_line("           size:  %s", sz_data);
+    box_mid(" ");
+
+    // BSS
+    box_line(C_BBLUE "[BSS]      uninitialized globals" C_RESET);
+    box_line("           range: 0x%016" PRIx64 " - 0x%016" PRIx64, bss_start, bss_end);
+    box_line("           size:  %s", sz_bss);
+    box_mid(" ");
+
+    // RODATA
+    box_line(C_BBLUE "[RODATA]   read-only data (string literals, etc.)" C_RESET);
+    box_line("           range: 0x%016" PRIx64 " - 0x%016" PRIx64, rodata_start, rodata_end);
+    box_line("           size:  %s", sz_rodata);
+    box_mid(" ");
+
+    // TEXT
+    box_line(C_BBLUE "[TEXT]     program machine code (executable)" C_RESET);
+    box_line("           range: 0x%016" PRIx64 " - 0x%016" PRIx64, text_start, text_end);
+    box_line("           size:  %s", sz_text);
+    
+    box_bot("0x0000000000000000");
+    printf("\n");
+}
 
 /* ---------- DUMP ONE CHUNK ---------- */
 static void dump_one(int i)
@@ -121,7 +377,6 @@ static void dump_one(int i)
 
     int p_inuse  = (raw_size >> 0) & 1;
     int mmapped  = (raw_size >> 1) & 1;
-    int non_main = (raw_size >> 2) & 1;
 
     printf("\n");
     rule_heavy();
@@ -134,7 +389,7 @@ static void dump_one(int i)
         printf("  REGION: [MMAP] (isolated mapping far from the heap)\n");
         printf("  TYPE:   MMAPPED CHUNK\n");
         cr_();
-        printf("  These are allocated via mmap() because they exceed the 128KB threshold.\n");
+        printf("  These are allocated via mmap() because they exceed the threshold.\n");
         printf("  They do NOT have neighbors. There is no 'next chunk'.\n\n");
     } else {
         c_(C_GREEN);
@@ -146,7 +401,6 @@ static void dump_one(int i)
 
     if (!mmapped) {
         uint64_t in_chunk = nb - 16;
-        uint64_t usable   = nb - 8;
         uint64_t spill    = (rq > in_chunk) ? (rq - in_chunk) : 0;
         
         printf("  %-20s %zu\n",         "requested bytes", rq);
@@ -154,7 +408,6 @@ static void dump_one(int i)
         printf("  %-20s %" PRIu64 "\n", "in-chunk user bytes", in_chunk);
         printf("  %-20s %" PRIu64 "\n", "spill bytes", spill);
 
-        /* prev_size */
         printf("\n  ");
         c_(C_DIM); printf("── "); cr_();
         c_(C_BBLUE); printf("prev_size"); cr_();
@@ -164,16 +417,24 @@ static void dump_one(int i)
 
         if (p_inuse) {
             field_label("STATE");
-            c_(C_BGREEN); printf("UNUSED"); cr_();
+            if (prev_slot == 0) {
+                c_(C_BGREEN); printf("UNUSED (all zeroes)"); cr_();
+            } else {
+                c_(C_YELLOW); printf("IGNORED (contains spillover data)"); cr_();
+            }
             printf("\n");
             c_(C_DIM);
             printf("     WHY        bit 0 of \"size\" (PREV_INUSE) is 1\n");
             printf("                → previous chunk is allocated\n");
-            printf("                → bytes above are leftover user data\n");
+            printf("                → glibc does not read this field as a size\n");
+            if (prev_slot != 0) {
+                printf("                → the bytes above are active user payload\n");
+                printf("                  spilled over from the previous chunk\n");
+            }
             cr_();
         } else {
             field_label("STATE");
-            c_(C_BYELLOW); printf("HOLDS SIZE OF PREVIOUS CHUNK"); cr_();
+            c_(C_BYELLOW); printf("ACTIVE (holds previous chunk size)"); cr_();
             printf("\n");
             c_(C_DIM);
             printf("     WHY        bit 0 of \"size\" (PREV_INUSE) is 0\n");
@@ -182,7 +443,6 @@ static void dump_one(int i)
             cr_();
         }
 
-        /* size */
         printf("\n  ");
         c_(C_DIM); printf("── "); cr_();
         c_(C_BBLUE); printf("size"); cr_();
@@ -194,7 +454,6 @@ static void dump_one(int i)
         field_label("size");
         printf("0x%" PRIx64 " = %" PRIu64 " bytes\n", nb, nb);
 
-        /* user area & spill */
         printf("\n  ");
         c_(C_DIM); printf("── "); cr_();
         c_(C_BBLUE); printf("user area"); cr_();
@@ -219,7 +478,17 @@ static void dump_one(int i)
             printf("     ");
             c_(C_DIM); printf("0x%" PRIx64, a); cr_();
             printf("   ");
-            print_memory_row(v);
+            if (!COLOR) printf("%016" PRIx64, v);
+            else {
+                for (int i = 0; i < 8; i++) {
+                    uint8_t b = (v >> (8*i)) & 0xff;
+                    if (b == FILL_BYTE && b != 0) fputs(C_BMAG, stdout);
+                    else if (b == 0)              fputs(C_GRAY, stdout);
+                    else                          fputs(C_CYAN, stdout);
+                    printf("%02x ", b);
+                    cr_();
+                }
+            }
             c_(C_DIM); printf("   as 0x%016" PRIx64 "%s\n", v, r == 0 ? "  ← user_ptr" : ""); cr_();
         }
         if (show_last > 0) {
@@ -233,7 +502,17 @@ static void dump_one(int i)
                 printf("     ");
                 c_(C_DIM); printf("0x%" PRIx64, a); cr_();
                 printf("   ");
-                print_memory_row(v);
+                if (!COLOR) printf("%016" PRIx64, v);
+                else {
+                    for (int i = 0; i < 8; i++) {
+                        uint8_t b = (v >> (8*i)) & 0xff;
+                        if (b == FILL_BYTE && b != 0) fputs(C_BMAG, stdout);
+                        else if (b == 0)              fputs(C_GRAY, stdout);
+                        else                          fputs(C_CYAN, stdout);
+                        printf("%02x ", b);
+                        cr_();
+                    }
+                }
                 c_(C_DIM); printf("   as 0x%016" PRIx64 "%s\n", v, r == total_rows - 1 ? "  ← last row" : ""); cr_();
             }
         }
@@ -255,47 +534,37 @@ static void dump_one(int i)
     } 
     else 
     {
-        /* --------------------------------------------------------- */
-        /* MMAPPED CHUNK SPECIAL HANDLING                            */
-        /* --------------------------------------------------------- */
         printf("  %-20s %zu\n",         "requested bytes", rq);
         printf("  %-20s %" PRIu64 "\n", "chunk size (nb)", nb);
-        printf("  %-20s %s\n",          "in-chunk user bytes", "N/A (entire mapping is for this chunk)");
-        printf("  %-20s %s\n",          "spill bytes",          "N/A (no next chunk to spill into)");
 
-        /* prev_size */
         printf("\n  ");
         c_(C_DIM); printf("── "); cr_();
         c_(C_BBLUE); printf("prev_size"); cr_();
         c_(C_DIM); printf(" (chunk_start + 0) ───────────────────────────────────────\n"); cr_();
         field_addr("address", cstart);
         field_memory("memory", prev_slot);
-        field_value("as int", prev_slot);
         
         field_label("STATE");
         c_(C_BYELLOW); printf("OFFSET TO MMAP BASE"); cr_();
         printf("\n");
         c_(C_DIM);
         printf("     WHY        bit 1 of \"size\" (IS_MMAPPED) is 1\n");
-        printf("                → this chunk is not on the contiguous heap\n");
         printf("                → there is no 'previous chunk'\n");
         printf("                → this field stores the offset from the kernel's mmap\n");
         printf("                  base to the chunk's start (so free() can munmap correctly)\n");
         printf("                → offset = 0x%" PRIx64 "\n", prev_slot);
         cr_();
 
-        /* size */
         printf("\n  ");
         c_(C_DIM); printf("── "); cr_();
         c_(C_BBLUE); printf("size"); cr_();
         c_(C_DIM); printf(" (chunk_start + 8) ─────────────────────────────────────────\n"); cr_();
         field_addr("address", cstart + 8);
         field_memory("memory", raw_size);
-        field_value("as int", raw_size);
         
         printf("     bit 0 ");
         c_(C_GRAY); printf("[%d]", p_inuse); cr_();
-        printf(" PREV_INUSE      %s\n", p_inuse ? "1" : "0 (mmapped chunks don't have a previous chunk)");
+        printf(" PREV_INUSE      %s\n", p_inuse ? "1" : "0");
 
         printf("     bit 1 ");
         if (mmapped) c_(C_BYELLOW); else c_(C_GRAY);
@@ -303,21 +572,10 @@ static void dump_one(int i)
         printf(" IS_MMAPPED      ");
         if (mmapped) {
             c_(C_YELLOW); printf("1 → this chunk was mmapped, use munmap() on free\n"); cr_();
-        } else {
-            printf("0\n");
         }
 
         field_label("size");
         printf("0x%" PRIx64 " = %" PRIu64 " bytes (total mapping length)\n", nb, nb);
-
-        /* user area */
-        printf("\n  ");
-        c_(C_DIM); printf("── "); cr_();
-        c_(C_BBLUE); printf("user area"); cr_();
-        c_(C_DIM); printf(" ─────────────────────────────────────────────────────────\n"); cr_();
-        printf("     pointer malloc returned: 0x%" PRIx64 "\n", u_addr);
-        printf("     The 16-byte header sits right before it.\n");
-        printf("     The rest of the mapping up to (chunk_start + size) is yours.\n");
     }
 }
 
@@ -351,7 +609,7 @@ int main(void)
         if (mmapped) {
             c_(C_BYELLOW);
             printf("    [MMAP THRESHOLD EXCEEDED]\n");
-            printf("    → chunk size (%" PRIu64 ") >= 128 KB (%" PRIu64 ")\n", nb, MMAP_THRESHOLD);
+            printf("    → chunk size (%" PRIu64 ") >= 128 KB initial threshold\n", nb);
             printf("    → BYPASSING [HEAP]. Requesting isolated mapping from OS via mmap().\n");
             printf("    → mapped at 0x%" PRIx64 " (Notice the 0x7f... high address)\n", chunk_start);
             printf("    → [HEAP] top is untouched at 0x%" PRIx64 "\n", HEAP_TOP);
@@ -385,6 +643,8 @@ int main(void)
     c_(C_BCYAN); printf("  INSPECTION PHASE\n"); cr_();
     rule_heavy();
     for (int i = 0; i < N; i++) dump_one(i);
+
+    draw_vmem_map();
 
     if (FREE_AT_END) {
         printf("\n");
